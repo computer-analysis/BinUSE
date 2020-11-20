@@ -1,0 +1,9 @@
+.idea
+*__pycache__*
+samples
+test.py
+*.log*
+*.info
+*.txt
+*.pdf
+figures
