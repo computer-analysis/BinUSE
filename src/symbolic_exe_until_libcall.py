@@ -5,8 +5,10 @@ from src.formulas_extractor import FormulaExtractor, _time_limit_for_a_block
 from angr.sim_options import resilience, UNDER_CONSTRAINED_SYMEXEC
 from src.lib_call_arguments import *
 from src.error import TimeoutForCollectingInfoException
+from src.config_for_sym_exe import get_init_sp, init_state_sp
 import claripy
 import copy
+import src
 
 finish_stash = 'finish'
 
@@ -63,6 +65,35 @@ class SELimiterPlugin(SimStatePlugin):
             return False
         return True
 
+    @staticmethod
+    def tail_loop_occurrence(unit, trace, bound):
+        unit_len = len(unit)
+        trace_len = len(trace)
+        for i in range(bound):
+            e_idx = trace_len - i * unit_len
+            b_idx = e_idx - unit_len
+            if b_idx < 0 or trace[b_idx:e_idx] != unit:
+                return False
+        return True
+
+
+    def in_loop(self):
+        cur = self.state.addr
+        # we do not treat it strictly, only see if cur occurred repeatedly
+        same_idxs = []
+        for idx in range(len(self.path_history)):
+            if self.path_history[idx] == cur:
+                same_idxs.append(idx)
+        count = len(same_idxs)
+
+        if count > 2:
+            for loop_split in range(1, count // 3):
+                loop_unit = self.path_history[same_idxs[0 - loop_split]:]
+                if self.tail_loop_occurrence(loop_unit, self.path_history[:-len(loop_unit)], self.loop_max):
+                    return True
+        return False
+
+
     def for_all_step(self, all_func_entries: dict):
         do_se = True
         self.path_history.append(self.state.addr)
@@ -89,17 +120,23 @@ class SELimiterPlugin(SimStatePlugin):
         # recurive call limiter
         occ = self._occurrence_in_call_stack(self.state.addr)
         if occ > self.recur_max:
+            log.debug("%s reaches max recursion limit" % str(self.state))
             do_se = False
 
         if not do_se:
             return do_se
         # loop limiter
-        occ = 0
-        for block_id in self.traces_in_funcs[-1]:
-            if self.state.addr == block_id:
-                occ += 1
-        if occ > self.loop_max:
+        if self.in_loop():
+            log.debug("%s reaches max loop limit" % str(self.state))
             do_se = False
+        # naive buggy loop limiter
+        # occ = 0
+        # for block_id in self.traces_in_funcs[-1]:
+        #     if self.state.addr == block_id:
+        #         occ += 1
+        # if occ > self.loop_max:
+        #     log.debug("%s reaches max loop limit" % str(self.state))
+        #     do_se = False
         return do_se
 
 
@@ -107,7 +144,6 @@ class MemAddrPlugin(SimStatePlugin):
     """
     To use this plugin, we need to add some code in angr/state_plugins/symbolic_memory.py
     Around line 390
-    for new version angr: angr/storage/memory_mixins/address_concretization_mixin.py, around line 190
     if a is not None:
         # added by BinUSE
         if hasattr(self.state, 'memaddr'):
@@ -148,19 +184,23 @@ class MemAddrPlugin(SimStatePlugin):
                 self.mem_ptr_symbols.add(expr)
             elif expr.depth == 2 and expr.symbolic:
                 if expr.op in {'__add__', '__sub__'}:
-                    if expr.args[0].symbolic and not expr.args[1].symbolic:
-                        # args[1] should be a BVV, and its value should be relatively small (a offset)
-                        self.mem_ptr_symbols.add(expr.args[0])
-                        self.mem_ptr_symbols_str.add(str(expr.args[0]))
-                    elif not expr.args[0].symbolic and expr.args[1].symbolic:
-                        self.mem_ptr_symbols.add(expr.args[1])
-                        self.mem_ptr_symbols_str.add(str(expr.args[1]))
+                    if len(expr.args) != 2:
+                        log.warning('Unknown why add and sub operation with a single argument, %s (%s, %s), treat it as a single parameter without the operation.' % (str(expr), str(expr.op), str(expr.args)))
+                        self.get_relative_symbol(expr.args[0])
                     else:
-                        log.error('Unsolvable expression for concretizing memory address %s' % str(expr))
-                        raise NotImplementedError()
+                        if expr.args[0].symbolic and not expr.args[1].symbolic:
+                            # args[1] should be a BVV, and its value should be relatively small (a offset)
+                            self.mem_ptr_symbols.add(expr.args[0])
+                            self.mem_ptr_symbols_str.add(str(expr.args[0]))
+                        elif not expr.args[0].symbolic and expr.args[1].symbolic:
+                            self.mem_ptr_symbols.add(expr.args[1])
+                            self.mem_ptr_symbols_str.add(str(expr.args[1]))
+                        else:
+                            log.warning('Unsolvable expression for concretizing memory address %s' % str(expr))
+                            # raise NotImplementedError()
                 else:
-                    log.error('Unsolvable expression for concretizing memory address %s' % str(expr))
-                    raise NotImplementedError()
+                    log.warning('Unsolvable expression for concretizing memory address %s' % str(expr))
+                    # raise NotImplementedError()
             else:
                 # It could be a very complex formula. 'If' condition is often in it, so we treat the whole formula as
                 # an input, since it is usually not being simplified.
@@ -201,15 +241,15 @@ class StopAtLibCallTech(ExplorationTechnique):
         self.default_args_esp_offset = None
         self.stack_args_enable = False
         if self.p.arch.name == 'AMD64':
-            self.call_args_map = X64_CALL_ARGUMENTS_MAP
+            self.call_args_map = src.lib_call_arguments.X64_CALL_ARGUMENTS_MAP
             self.default_arg_read = {'rdi', 'rsi'}
         elif self.p.arch.name == 'X86':
-            self.call_args_map = X86_CALL_ARGUMENTS_MAP
+            self.call_args_map = src.lib_call_arguments.X86_CALL_ARGUMENTS_MAP
             self.default_arg_read = {'edx', 'ecx'}
             self.default_args_esp_offset = [4, 8]
             self.stack_args_enable = True
         elif self.p.arch.name == 'AARCH64':
-            self.call_args_map = AARCH64_CALL_ARGUMENTS_MAP
+            self.call_args_map = src.lib_call_arguments.AARCH64_CALL_ARGUMENTS_MAP
             self.default_arg_read = {'x0', 'x1'}
         else:
             raise NotImplementedError()
@@ -222,16 +262,17 @@ class StopAtLibCallTech(ExplorationTechnique):
                                                      add_options=resilience | {UNDER_CONSTRAINED_SYMEXEC}
                                                      # add_options=simplification | symbolic | {ABSTRACT_MEMORY}
                                                      )
-        if self.p.arch.name == 'AMD64':
-            self.init_state.regs.rsp = claripy.BVV(0x7ffffffffff00000, 64)
-        elif self.p.arch.name == 'X86':
-            self.init_state.regs.esp = claripy.BVV(0x7ffff000, 32)
-        elif self.p.arch.name == 'AARCH64':
-            self.init_state.regs.sp =  claripy.BVV(0x7ffffffffff00000, 64)
+        # if self.p.arch.name == 'AMD64':
+        #     self.init_state.regs.rsp = claripy.BVV(0x7ffffffffff00000, 64)
+        # elif self.p.arch.name == 'X86':
+        #     self.init_state.regs.esp = claripy.BVV(0x7ffff000, 32)
+        # elif self.p.arch.name == 'AARCH64':
+        #     self.init_state.regs.sp = claripy.BVV(0x7ffffffffff00000, 64)
+        init_state_sp(self.init_state)
         return self.init_state
 
     def get_libcall_reg_read(self, libcall_name):
-        if self.p.arch == 'X86':
+        if self.p.arch.name == 'X86':
             return set()
         if libcall_name in self.call_args_map:
             reg_read = self.call_args_map[libcall_name]
@@ -249,12 +290,24 @@ class StopAtLibCallTech(ExplorationTechnique):
         return mem_read
 
     def step_state(self, simgr, state, **kwargs):
-        # log.debug('The number of states are %d' % len(simgr.stashes['active']))
-        # log.debug('Current trace of state: %s' % str(state.selimiter.path_history))
+        log.debug('The number of states are %d' % len(simgr.stashes['active']))
+        log.debug('Current trace of state: %s' % str(state.selimiter.path_history))
+        log.debug('Current state: %s' % str(state))
+        if len(self.all_keys) + len(simgr.unconstrained) >= 120:
+            log.warning('Reach max libcall records. DIscard all active states')
+            return {None: [], self.move_to: []}
+        if len(simgr.stashes['active']) >= 2000:
+            # angr may meet large swith structure and the number of states rises exponentially
+            # discard all info
+            # self.all_keys.clear()
+            # keep current info
+            # do nothing
+            log.warning('Reach max states limit. Discard all active states')
+            return {None: [], self.move_to: []}
         if state.selimiter.out_text_sec(self.text_range):
+            state.selimiter.path_history.append(state.addr)
             # it is likely in a lib call
             if state.addr in self.libcalls.keys():
-                state.selimiter.path_history.append(state.addr)
                 # here is a trick, the last block_id is supposed to be the entry of a lib call
                 # therefore, we use the lib call to check whether we should compare 2 trace
                 self.all_keys.append(tuple(state.selimiter.path_history))
@@ -273,13 +326,26 @@ class StopAtLibCallTech(ExplorationTechnique):
                 if state.addr not in self.all_lib_calls:
                     self.all_lib_calls[state.addr] = []
                 self.all_lib_calls[state.addr].append(tuple(state.selimiter.path_history))
-                return {None: [], self.move_to: []}
+
+                # for some special libcalls, we allow continuous symbolic execution to next libcall
+                # continuous_libcalls = {'.__errno_location'}
+                continuous_libcalls = set()
+                if self.libcalls[state.addr] in continuous_libcalls:
+                    # 2 step and we should return to the instruction after call .__errno_location
+                    log.debug(f'go through {self.libcalls[state.addr]}')
+                    tmp_sucs = state.step()
+                    if tmp_sucs.flat_successors:
+                        tmp_sucs = tmp_sucs.flat_successors[0].step()
+                        return {None: tmp_sucs.flat_successors, self.move_to: []}
+                    else:
+                        return {None: [], self.move_to: []}
+                else:
+                    return {None: [], self.move_to: []}
             else:
                 log.warning('IP register is not in text section and not in lib functions! init_state(0x%x), '
                             'execution trace %s' % (self.init_state.addr, str(state.selimiter.path_history)))
                 # return simgr.step_state(state)
                 # collect formulas here anyway
-                state.selimiter.path_history.append(state.addr)
                 self.all_keys.append(tuple(state.selimiter.path_history))
                 if self.stack_args_enable:
                     mem_read = self.get_libcall_mem_read(None, state.solver.eval(state.regs.esp))
@@ -299,9 +365,17 @@ class StopAtLibCallTech(ExplorationTechnique):
                     tmp = simgr.step_state(state)
                     return tmp
             except TimeoutForCollectingInfoException as e:
+                log.debug('Timeout a step for %s (%s)' % (str(state), self.p.filename))
                 return {None: [], self.move_to: []}
         else:
+            log.debug('Discard a state %s (%s)' % (str(state), self.p.filename))
             return {None: [], self.move_to: []}
+
+    def get_info_from_return_paths(self, simgr):
+        for s in simgr.unconstrained:
+            rib = tuple(s.selimiter.path_history + [None])
+            self.all_keys.append(rib)
+            self.fe.cache_constraint_from_state(s, rib, self.init_state)
 
     def merge_path_to_same_lib_call_together(self):
         res = dict()

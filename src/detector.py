@@ -1,9 +1,9 @@
-import os
+import os, sys
 import time
 from enum import Enum
 from queue import Queue
 import pickle
-
+import traceback
 from src.cmp_claripy import prove_equal, ast_prove_f1_in_f2, ast_prove_f1_equi_f2
 from src.cmp_tree import tree_equal, tree_distance
 from src.error import *
@@ -17,7 +17,8 @@ from src.symbolic_exe_until_libcall import StopAtLibCallTech
 import claripy
 from src.root_inst.root_inst_cfg import _time_limit_for_a_func
 from src.lib_call_args_analyze import get_libcall_args
-from src.lib_call_arguments import X86_CALL_ARGUMENTS_MAP
+import src
+from tqdm import tqdm
 
 _invalid_difference_value = 100000
 
@@ -30,6 +31,16 @@ def _random_select_n(a: list, n: int):
         random.shuffle(a)
         a = a[:n]
     return a
+
+
+def _save_pkl(obj, path):
+    with open(path, 'wb') as f:
+        pickle.dump(obj, f)
+
+
+def _load_pkl(path):
+    with open(path, 'rb') as f:
+        return pickle.load(f)
 
 
 class Detector:
@@ -105,20 +116,34 @@ class Detector:
         # initializing while comparing
         self._valid_funcs = [self._get_valid_func_ida(0), self._get_valid_func_ida(1)]
 
-        # must call following functions before
-        if self._alg == 'inline':
-            self.cache_all_basic_block_level_simple_cfg(0)
-            self.cache_all_basic_block_level_simple_cfg(1)
-            self._libcalls = [filter_libcall(self._get_func_addr_name_map(0)),
-                              filter_libcall(self._get_func_addr_name_map(1))]
-            self._call_matrix = [self.get_call_graph_matrix(0), self.get_call_graph_matrix(1)]
-            for proj_id in range(len(self._p)):
-                if self._p[proj_id].arch.name == 'X86':
-                    # for X86 software, we may need update the X86_CALL_ARGUMENTS_MAP first
-                    X86_CALL_ARGUMENTS_MAP.update(self.get_x86_lib_call_arg_offsets(proj_id))
+        self.init_info_for_inline_mode()
 
     def get_x86_lib_call_arg_offsets(self, proj_id):
         return get_libcall_args(self._libcalls[proj_id], self._valid_funcs[proj_id], self._p[proj_id])
+
+    def init_info_for_inline_mode(self):
+        # must call following functions before
+        if self._alg == 'inline':
+            self._libcalls = [filter_libcall(self._get_func_addr_name_map(0)),
+                              filter_libcall(self._get_func_addr_name_map(1))]
+            try:
+                self._call_matrix = [self.load_call_matrix(0), self.load_call_matrix(1)]
+            except Exception:
+                self.cache_all_basic_block_level_simple_cfg(0)
+                self.cache_all_basic_block_level_simple_cfg(1)
+                self._call_matrix = [self.get_call_graph_matrix(0), self.get_call_graph_matrix(1)]
+            for proj_id in range(len(self._p)):
+                if self._p[proj_id].arch.name == 'X86':
+                    # for X86 software, we may need update the X86_CALL_ARGUMENTS_MAP first
+                    # X86_CALL_ARGUMENTS_MAP.update(self.get_x86_lib_call_arg_offsets(proj_id))
+                    tmp = self.get_x86_lib_call_arg_offsets(proj_id)
+                    tmp.update(src.lib_call_arguments.X86_CALL_ARGUMENTS_MAP)
+                    src.lib_call_arguments.X86_CALL_ARGUMENTS_MAP.update(tmp)
+
+    def load_call_matrix(self, pid):
+        prefix = self._p[pid].filename + '_analysis'
+        save_to = os.path.join(prefix, 'call_matrix')
+        return _load_pkl(save_to)
 
     def save_to_disk(self, p_ids=(0, 1)):
         """
@@ -127,6 +152,8 @@ class Detector:
         self._visited_RI_callees
         self._fe
         """
+        rec_limit = sys.getrecursionlimit()
+        sys.setrecursionlimit(rec_limit * 5)
         for p_id in p_ids:
             prefix = self._p[p_id].filename + '_analysis'
             if not os.path.isdir(prefix):
@@ -137,7 +164,10 @@ class Detector:
                 pickle.dump(self._visited_RI_callees[p_id], f)
             with open(os.path.join(prefix, '1st_libcall'), 'wb') as f:
                 pickle.dump(self._visited_1st_libcall[p_id], f)
+            with open(os.path.join(prefix, 'call_matrix'), 'wb') as f:
+                pickle.dump(self._call_matrix[p_id], f)
             self._fe[p_id].save_visit_data(os.path.join(prefix, 'fe_data'))
+        sys.setrecursionlimit(rec_limit)
 
     def load_analysis(self, p_ids=(0, 1)):
         """
@@ -157,6 +187,8 @@ class Detector:
                     self._visited_RI_callees[p_id] = pickle.load(f)
                 with open(os.path.join(prefix, '1st_libcall'), 'rb') as f:
                     self._visited_1st_libcall[p_id] = pickle.load(f)
+                # with open(os.path.join(prefix, 'call_matrix'), 'rb') as f:
+                #     self._call_matrix[p_id] = pickle.load(f)
                 self._fe[p_id].load_visit_data(os.path.join(prefix, 'fe_data'))
             except Exception:
                 load_fail.append(p_id)
@@ -242,7 +274,7 @@ class Detector:
     def get_formulas_and_constraints_from(self, block_id, proj_id):
         return self._fe[proj_id].get_formulas_from(block_id, self._current_callees[proj_id])
 
-    def cmp_func(self, start0, start1, inline_depth0=0, inline_depth1=0, mode='ri'):
+    def cmp_func(self, start0, start1, inline_depth0=0, inline_depth1=0, mode='ri', not_sym_exe=False, no_skip=False):
         """
         compare 2 functions in 1st and 2nd projects respectively
         :param start0: the block id in the 1st project
@@ -271,15 +303,18 @@ class Detector:
             # mode is useless here, self._mode must be smt
             assert self._mode == 'smt'
             sim = self._inlined_callees_cmp(start0, start1)
-            if sim == -1:
-                # we do not handle this currently, but after finishing all functions with lib calls, the similarity
-                # of functions without lib calls can be calculated
-                return 0.0, _invalid_difference_value
-            elif sim < 0.01:
-                # we do not run symbolic execution to compare these 2 functions
-                return 0.0, _invalid_difference_value
+            if no_skip:
+                return self._cmp_func_inline_mode(start0, start1, inline_depth0, inline_depth1, sim, not_sym_exe=not_sym_exe)
             else:
-                return self._cmp_func_inline_mode(start0, start1, inline_depth0, inline_depth1, sim)
+                if sim == -1:
+                    # we do not handle this currently, but after finishing all functions with lib calls, the similarity
+                    # of functions without lib calls can be calculated
+                    return 0.0, _invalid_difference_value
+                elif sim < 0.01:
+                    # we do not run symbolic execution to compare these 2 functions
+                    return 0.0, _invalid_difference_value
+                else:
+                    return self._cmp_func_inline_mode(start0, start1, inline_depth0, inline_depth1, sim, not_sym_exe=not_sym_exe)
         else:
             raise NotImplementedError()
 
@@ -394,7 +429,54 @@ class Detector:
 
         return total_eq_blocks / total_blocks_num, abs(len(simple_cfg1.pool) - len(simple_cfg0.pool))
 
-    def _cmp_func_inline_mode(self, start0, start1, inline_depth0=0, inline_depth1=0, sim=0.0):
+    def get_formula_stop_at_lib_call(self, start, proj_id, not_sym_exe):
+        if start not in self._visited_1st_libcall[proj_id]:
+            if not_sym_exe:
+                raise FunctionWithoutFormulaDataException(self._p[proj_id], start)
+            log.info('collecting formulas from 0x%x(%s)' % (start, self._p[proj_id].filename))
+            tech = StopAtLibCallTech(start, self._p[proj_id], self._fe[proj_id],
+                                     self._libcalls[proj_id], self._valid_funcs[proj_id])
+            simgr = self._p[proj_id].factory.simgr(tech.create_init_state(), techniques=[tech])
+            try:
+                with _time_limit_for_a_func(600, start):
+                    simgr.run()
+            except TimeoutForCollectingInfoException as e:
+                log.error(str(e))
+            except Exception as e:
+                log.error('Unknown Exception %s 0x%x (%s)' % (str(e), start, self._p[proj_id].filename))
+                exc_type, exc_obj, exc_tb = sys.exc_info()
+                err_fname = os.path.split(exc_tb.tb_frame.f_code.co_filename)[1]
+                log.error('Unexpected error from %s' % str((exc_type, err_fname, exc_tb.tb_lineno)))
+                # log.error(traceback.format_exc())
+
+            if len(tech.all_keys) > 0:
+                # Should we collect info from return?
+                tech.get_info_from_return_paths(simgr)
+            # the precision improvement of merging formulas is no significant, but it cause relatively huge overhead
+            # we do not use it currently
+            if False:
+                self._visited_1st_libcall[proj_id][start] = (tech.all_keys, None, None)
+            else:
+                self._visited_1st_libcall[proj_id][start] = (tech.all_keys, tech.all_lib_calls,
+                                                             tech.merge_path_to_same_lib_call_together())
+
+            # for key in self._visited_1st_libcall[proj_id][start]:
+            #     print(self._fe[proj_id]._visited[key])
+
+        return self._visited_1st_libcall[proj_id][start]
+
+    def pop_collected_formulas(self, start, proj_id):
+        """
+        remove the data collected on this function
+        """
+        if start not in self._visited_1st_libcall[proj_id]:
+            return
+        ks, libcalls, merged_args = self._visited_1st_libcall[proj_id][start]
+        for k in ks:
+            self._fe[proj_id]._visited.pop(k)
+        self._visited_1st_libcall[proj_id].pop(start)
+
+    def _cmp_func_inline_mode(self, start0, start1, inline_depth0=0, inline_depth1=0, sim=0.0, not_sym_exe=False):
         """
         inline functions other than lib calls, collect the formulas of arguments of lib calls to compare the similarity
         of these 2 functions
@@ -404,33 +486,6 @@ class Detector:
         :param inline_depth1:
         :return:
         """
-
-        def get_formula_keys(start, proj_id):
-            if start not in self._visited_1st_libcall[proj_id]:
-                log.info('collecting formulas from 0x%x(%s)' % (start, self._p[proj_id].filename))
-                tech = StopAtLibCallTech(start, self._p[proj_id], self._fe[proj_id],
-                                         self._libcalls[proj_id], self._valid_funcs[proj_id])
-                simgr = self._p[proj_id].factory.simgr(tech.create_init_state(), techniques=[tech])
-                try:
-                    with _time_limit_for_a_func(600, start):
-                        simgr.run()
-                except TimeoutForCollectingInfoException as e:
-                    log.error(str(e))
-                except Exception as e:
-                    log.error('Unknown Exception %s 0x%x (%s)' % (str(e), start, self._p[proj_id].filename))
-                # the precision improvement of merging formulas is no significant, but it cause relatively huge overhead
-                # we do not use it currently
-                if False:
-                    self._visited_1st_libcall[proj_id][start] = (tech.all_keys, None, None)
-                else:
-                    self._visited_1st_libcall[proj_id][start] = (tech.all_keys, tech.all_lib_calls,
-                                                                 tech.merge_path_to_same_lib_call_together())
-
-                # for key in self._visited_1st_libcall[proj_id][start]:
-                #     print(self._fe[proj_id]._visited[key])
-
-            return self._visited_1st_libcall[proj_id][start]
-
         def merge_formula_with_constraints(block_id, proj_id):
             formulas, constraints, input = self.get_formulas_and_constraints_from(block_id, proj_id)
             log.debug('formulas    = %s (%s trace %s)' % (str(formulas), self._p[proj_id].filename, str(block_id)))
@@ -438,7 +493,10 @@ class Detector:
             log.debug('read_from   = %s (%s trace %s)' % (str(input), self._p[proj_id].filename, str(block_id)))
             merged_formulas = []
             for f in formulas:
-                merged_formulas.append(merge_fe_formulas([(f[1], constraints)], ptr_size=f[1].size())[0])
+                # a tuple, (merged_formula, original_formula)
+                # when the constraint on its path (or the path constraint of the block being compared) is already UNSAT
+                # we use the original formula for comparison
+                merged_formulas.append((merge_fe_formulas([(f[1], constraints)], ptr_size=f[1].size())[0], f[1]))
             log.debug(
                 'merged_formulas = %s (%s trace %s)' % (str(merged_formulas), self._p[proj_id].filename, str(block_id)))
             return merged_formulas, constraints, input
@@ -451,24 +509,27 @@ class Detector:
                 if len(merged_f0) > 0 and len(merged_f1) > 0:
                     already_matched = set()
                     for f0 in merged_f0:
-                        for f1 in merged_f1:
-                            if f1 in already_matched:
+                        for f1_idx in range(len(merged_f1)):
+                            if f1_idx in already_matched:
                                 continue
-                            if prove_equal(f0, f1, in0, in1, c0, c1, cmp_limit=120):
-                                already_matched.add(f1)
+                            f1 = merged_f1[f1_idx]
+                            if prove_equal(f0, f1, self._fe[0].ptr_size, self._fe[1].ptr_size, c0, c1, cmp_limit=120):
+                                already_matched.add(f1_idx)
+                                log.debug(f'Matched {str(f0)} and {str(f1)}')
                                 break
                     if len(already_matched) > 0:
                         return len(already_matched) / len(merged_f0)
                     else:
                         # if no formula matches and the constraints are complex enough, we compare constraints only
                         if len(c0) + len(c1) > 2 \
-                                and ast_prove_f1_equi_f2(claripy.And(*c0), claripy.And(*c1), cmp_limit=120):
+                                and ast_prove_f1_equi_f2(claripy.And(*c0), claripy.And(*c1),
+                                                         self._fe[0].ptr_size, self._fe[1].ptr_size, cmp_limit=120):
                             return self._symbolic_eq_block_threshold
                         else:
                             return 0.0
                 else:
                     # no formulas are collected, we compare constraints only
-                    if ast_prove_f1_equi_f2(claripy.And(*c0), claripy.And(*c1), cmp_limit=720):
+                    if ast_prove_f1_equi_f2(claripy.And(*c0), claripy.And(*c1), self._fe[0].ptr_size, self._fe[1].ptr_size, cmp_limit=720):
                         return self._symbolic_eq_block_threshold
             except TooManyVariables4Comparison as e:
                 # the output of this error could be huge
@@ -479,9 +540,15 @@ class Detector:
             except Exception as e:
                 log.error("meet %s while comparing 0x%x (%s) with 0x%x (%s)" %
                           (str(e), start0, self._p[0].filename, start1, self._p[1].filename))
+                exc_type, exc_obj, exc_tb = sys.exc_info()
+                err_fname = os.path.split(exc_tb.tb_frame.f_code.co_filename)[1]
+                log.error('Unexpected error from %s' % str((exc_type, err_fname, exc_tb.tb_lineno)))
+                # log.error(traceback.format_exc())
             return 0.0
 
         def endswith_libcall(path_trace, proj_id):
+            if path_trace[-1] is None:
+                return 'RETURN'
             if path_trace[-1] in self._libcalls[proj_id].keys():
                 return self._libcalls[proj_id][path_trace[-1]]
             else:
@@ -490,6 +557,7 @@ class Detector:
         def similar_libcalls(trace0, trace1):
             call0, call1 = endswith_libcall(trace0, 0), endswith_libcall(trace1, 1)
             log.debug('traces end at libcall %s and %s' % (str(call0), str(call1)))
+            # log.error('traces end at libcall %s and %s' % (str(call0), str(call1)))
             if call0 == call1:
                 return True
             if call0 is None or call1 is None:
@@ -505,12 +573,12 @@ class Detector:
                 return True
             return False
 
-        ks0, libcalls0, merged_args0 = get_formula_keys(start0, 0)
+        ks0, libcalls0, merged_args0 = self.get_formula_stop_at_lib_call(start0, 0, not_sym_exe)
         if len(ks0) == 0:
             log.warning('no lib call formulas are collected from 0x%x (%s)' % (start0, self._p[0].filename))
             raise InvalidFunctionException(start0)
 
-        ks1, libcalls1, merged_args1 = get_formula_keys(start1, 1)
+        ks1, libcalls1, merged_args1 = self.get_formula_stop_at_lib_call(start1, 1, not_sym_exe)
         if len(ks1) == 0:
             log.warning('no lib call formulas are collected from 0x%x (%s)' % (start1, self._p[1].filename))
             raise InvalidFunctionException(start1)
@@ -564,7 +632,7 @@ class Detector:
                         c0 = merged_args0[k0[-1]][0][2]
                         c1 = merged_args1[k1[-1]][0][2]
                         try:
-                            if ast_prove_f1_equi_f2(c0, c1, 720):
+                            if ast_prove_f1_equi_f2(c0, c1, self._fe[0].ptr_size, self._fe[1].ptr_size, 720):
                                 for tmp_path in merged_args0[k0[-1]][0][1]:
                                     already_matched_keys.add(tmp_path)
                                 continue
@@ -579,13 +647,16 @@ class Detector:
                         except Exception as e:
                             log.error("meet %s while comparing 0x%x (%s) with 0x%x (%s)" %
                                       (str(e), start0, self._p[0].filename, start1, self._p[1].filename))
+                            exc_type, exc_obj, exc_tb = sys.exc_info()
+                            err_fname = os.path.split(exc_tb.tb_frame.f_code.co_filename)[1]
+                            log.error('Unexpected error from %s' % str((exc_type, err_fname, exc_tb.tb_lineno)))
+                            # log.error(traceback.format_exc())
                             for tmp_path in merged_args0[k0[-1]][0][1]:
                                 already_matched_keys.add(tmp_path)
                             continue
 
                 tmp = cmp(k0, k1)
                 if tmp >= self._symbolic_eq_block_threshold:
-                    log.debug("%s matches %s" % (str(k0), str(k1)))
                     already_matched_keys.add(k1)
                     break
         self._compared_res[(start0, start1)] = (len(already_matched_keys) / len(ks0), 1.0 - sim)
@@ -983,7 +1054,7 @@ class Detector:
                     if reg == f0[0]:
                         for f1 in formulas1:
                             if reg == f1[0]:
-                                if prove_equal(f0[1], f1[1], input0, input1, constraints0, constraints1):
+                                if prove_equal(f0[1], f1[1], self._fe[0].ptr_size, self._fe[1].ptr_size, constraints0, constraints1):
                                     self._block_cmp_cache[(block0, block1)] = 1.0
         if self._block_cmp_cache[(block0, block1)] >= self._symbolic_eq_block_threshold:
             return True
@@ -991,18 +1062,18 @@ class Detector:
         # test all registers
         for formulas1, constraints1, input1 in info1:
             matched = 0
-            constraint_matched = prove_equal(claripy.And(*constraints0), claripy.And(*constraints1), input0, input1)
+            constraint_matched = prove_equal(claripy.And(*constraints0), claripy.And(*constraints1), self._fe[0].ptr_size, self._fe[1].ptr_size)
             already_matched = set()
             for f0 in formulas0:
                 for f1 in formulas1:
                     if f1[0] in already_matched:
                         continue
                     if constraint_matched:
-                        if prove_equal(f0[1], f1[1], input0, input1):
+                        if prove_equal(f0[1], f1[1], self._fe[0].ptr_size, self._fe[1].ptr_size):
                             matched += 1
                             already_matched.add(f1[0])
                     else:
-                        if prove_equal(f0[1], f1[1], input0, input1, constraints0, constraints1):
+                        if prove_equal(f0[1], f1[1], self._fe[0].ptr_size, self._fe[1].ptr_size, constraints0, constraints1):
                             matched += 1
                             already_matched.add(f1[0])
             if constraint_matched:
@@ -1100,10 +1171,18 @@ class Detector:
         :param proj_id:
         :return:
         """
+        func_n = len(self._valid_funcs[proj_id])
+        count = 0
+        step = 100
+        pbar = tqdm(func_n)
         for func_entry in self._valid_funcs[proj_id]:
+            count += 1
             # the returns are scfg, callees, num_callee
             self._visited_basic_block_scfgs[proj_id][func_entry] = \
                 self._p_builder[proj_id].build_func_basic_block_level_simple_cfg(func_entry)
+            if count % step == 0:
+                pbar.update(step)
+        pbar.close()
 
     def get_call_graph_matrix(self, proj_id):
         """
@@ -1141,40 +1220,24 @@ class Detector:
                         matrix[caller + offset][1].add(callee_entry)
 
         # update the matrix repeatedly, until no modification on the matrix
-        while True:
+        max_loop_count = len(matrix)
+        for loop_count in range(max_loop_count):
             updated = False
             for caller_entry in matrix.keys():
-                # include callees' callees
-                update_text = dict()
-                update_lib_call = set()
+                user_def_callee_num = len(matrix[caller_entry][0])
+                extn_def_callee_num = len(matrix[caller_entry][1])
+                update_user_call = matrix[caller_entry][0].copy()
+                update_extn_call = matrix[caller_entry][1].copy()
                 for callee_entry, depth in matrix[caller_entry][0].items():
-                    next_callees = matrix[callee_entry][0]
-                    next_lib_calls = matrix[callee_entry][1]
-
-                    if len(next_lib_calls.intersection(matrix[caller_entry][1])) < len(next_lib_calls):
-                        # not all elements have already been included
-                        update_lib_call.update(next_lib_calls)
-
-                    for next_callee_entry, next_depth in next_callees.items():
-                        if next_callee_entry not in matrix[caller_entry][0].keys():
-                            # this next_callee_entry is not in caller call set
-                            update_text[next_callee_entry] = next_depth + depth
-                        elif next_depth + depth < matrix[caller_entry][0][next_callee_entry]:
-                            # find a short path
-                            update_text[next_callee_entry] = next_depth + depth
-
-                        if len(matrix[next_callee_entry][1].intersection(matrix[caller_entry][1])) < \
-                                len(matrix[next_callee_entry][1]):
-                            # not all elements have already been included
-                            update_lib_call.update(matrix[next_callee_entry][1])
-
-                if len(update_text.keys()) > 0:
+                    for next_callee_entry, next_depth in matrix[callee_entry][0].items():
+                        if next_callee_entry not in update_user_call:
+                            update_user_call[next_callee_entry] = next_depth + depth
+                        update_extn_call.update(matrix[next_callee_entry][1])
+                    update_extn_call.update(matrix[callee_entry][1])
+                if len(update_user_call) != user_def_callee_num or len(update_extn_call) != extn_def_callee_num:
                     updated = True
-                    matrix[caller_entry][0].update(update_text)
-                if len(update_lib_call) > 0:
-                    updated = True
-                    matrix[caller_entry][1].update(update_lib_call)
-
+                    matrix[caller_entry][0] = update_user_call
+                    matrix[caller_entry][1] = update_extn_call
             if not updated:
                 break
         return matrix
@@ -1272,6 +1335,7 @@ class Detector:
         text_sec_callees1, other_sec_callees1 = self.get_inline_callees_of_a_func(start1, 1)
         if len(other_sec_callees0) == 0 and len(other_sec_callees1) == 0:
             # no lib call, we need to compare it with other functions in other way
+            log.debug('both do not invoke functions in other sections')
             return -1
         # the function names in text section cannot be used, since they do not exist after strip
         # lib calls can be used to show the basic functionality of functions
@@ -1281,6 +1345,9 @@ class Detector:
         log.debug(str(callee_names1))
         log.debug(str(self.get_names_of_funcs(text_sec_callees0, 0)))
         log.debug(str(self.get_names_of_funcs(text_sec_callees1, 1)))
+        # normalize libcall names
+        # callee_names0 = set(map(lambda n: n if n.startswith('.') else f'.{n}', callee_names0))
+        # callee_names1 = set(map(lambda n: n if n.startswith('.') else f'.{n}', callee_names1))
         # measure the similarity of lib calls
         # By obfuscation, it is possible to introduce useless functions
         # Some functions are special. Their functionalities are the same, but are different due to compilation options
@@ -1320,7 +1387,7 @@ class Detector:
             f1_similarity_matrix[f_k0] = Detector.sort_detect_similar_func_res(f1_similarity_matrix[f_k0])
         return f1_similarity_matrix
 
-    def cmp_bins(self, mode='ri', progress_outfile=None):
+    def cmp_bins(self, mode='ri', progress_outfile=None, not_sym_exe=False, no_skip=False):
         """
         compare 2 binaries, function by function
         here we merely compare functions being located in .text section
@@ -1336,9 +1403,9 @@ class Detector:
 
         log.debug("%d valid functions in %s" % (len(self._valid_funcs[0]), self._p[0].filename))
         f1_similarity_matrix = dict()
-        for f_k0 in self._valid_funcs[0]:
+        for f_k0 in tqdm(self._valid_funcs[0], desc='comparing :'):
             f1_similarity_matrix[f_k0] = Detector.sort_detect_similar_func_res(
-                self.detect_similar_func(f_k0, mode=mode))
+                self.detect_similar_func(f_k0, mode=mode, not_sym_exe=not_sym_exe, no_skip=no_skip))
             # f_k0 has finished, pop it out from cache
             # but for future comparison speed, we need to store this data later
             # if f_k0 in self._visited_RI_funcs[0].keys():
@@ -1348,9 +1415,9 @@ class Detector:
                 with open(progress_outfile, 'a') as outfile:
                     self.analyse_func_detect_res(f_k0, f1_similarity_matrix[f_k0], verbose=1, outfile=outfile)
 
-        if self._alg == 'inline':
-            tmp = self._inline_cmp_functions_without_lib_calls()
-            f1_similarity_matrix.update(tmp)
+        # if self._alg == 'inline':
+        #     tmp = self._inline_cmp_functions_without_lib_calls()
+        #     f1_similarity_matrix.update(tmp)
         return f1_similarity_matrix
 
     def _get_func_addr_name_map(self, proj_id):
@@ -1372,7 +1439,27 @@ class Detector:
                 f_map[f_addr] = self._cfg[proj_id].functions[f_addr].name
         return f_map
 
-    def _similar_func_res_addr_to_name(self, res: list, f_map):
+    def _get_func_name_addr_map(self, proj_id):
+        f_map = dict()
+        map_file = self._p[proj_id].filename + '_functions/func_map'
+        if os.path.isfile(map_file):
+            with open(map_file, 'r') as mf:
+                offset = get_offset(self._p[proj_id])
+                lines = mf.readlines()
+                for line in lines:
+                    tmp = line.split(' : ')
+                    if len(tmp) == 2:
+                        f_addr = int(tmp[0], 16)
+                        f_name = tmp[1].strip()
+                        f_map[f_name] = offset + f_addr
+        else:
+            # use angr cfg to generate the map
+            for f_addr in self._valid_funcs[proj_id]:
+                f_map[self._cfg[proj_id].functions[f_addr].name] = f_addr
+        return f_map
+
+    @staticmethod
+    def _similar_func_res_addr_to_name(res: list, f_map):
         tmp = []
         for addr, sim in res:
             tmp.append((f_map[addr], sim))
@@ -1406,7 +1493,7 @@ class Detector:
                 return -1.0, _invalid_difference_value, False
         return 0.0, _invalid_difference_value, True
 
-    def detect_similar_func(self, start0, mode='ri'):
+    def detect_similar_func(self, start0, mode='ri', not_sym_exe=False, no_skip=False):
         """
         We compare a function in proj_0 with all functions in proj_1, and get a dictionary of
         {proj_1_func_addr: similarity}
@@ -1414,7 +1501,7 @@ class Detector:
         :return: dictionary {proj_1_func_addr: similarity}
         """
         log.info("detect similar function 0x%x in binary %s" % (start0, self._p[0].filename))
-        log.debug("%d valid functions in %s" % (len(self._valid_funcs[1]), self._p[1].filename))
+        log.info("%d valid functions in %s" % (len(self._valid_funcs[1]), self._p[1].filename))
         if start0 not in self._valid_funcs[0]:
             log.warning(str(InvalidFunctionException(start0)))
             return dict()
@@ -1422,16 +1509,26 @@ class Detector:
         comparison_res = dict()
         for start1 in self._valid_funcs[1]:
             try:
-                comparison_res[start1] = self.cmp_func(start0, start1, mode=mode)
+                comparison_res[start1] = self.cmp_func(start0, start1, mode=mode, not_sym_exe=not_sym_exe, no_skip=no_skip)
             except InvalidFunctionException as e:
                 log.warning(str(e))
                 if e.get_func_ptr() == start0:
                     # if the invalid function is the source function, we should exit the loop
                     break
+                else:
+                    comparison_res[start1] = (0.0, _invalid_difference_value)
             except TooHardToSolveException as e:
                 log.warning(str(e))
                 if e.get_func_ptr() == start0:
                     break
+                else:
+                    comparison_res[start1] = (0.0, _invalid_difference_value)
+            except FunctionWithoutFormulaDataException as e:
+                log.warning(str(e))
+                if e.get_func_ptr() == start0:
+                    break
+                else:
+                    comparison_res[start1] = (0.0, _invalid_difference_value)
         return comparison_res
 
     def analyse_detect_similar_func_res(self, start0, res: list):
@@ -1461,7 +1558,7 @@ class Detector:
                 outfile.write(res_str + '\n')
         return res_str
 
-    def analyse_cmp_bins_res(self, res: dict, top_ns=None, verbose=1):
+    def analyse_cmp_bins_res(self, res: dict, top_ns=None, verbose=1, output_stream=sys.stdout):
         """
         :param res: a dictionary of sorted lists (result from detect_similar_func, the sort it)
         :param top_ns:
@@ -1476,11 +1573,11 @@ class Detector:
             match_idx, new_detect_res = self.analyse_detect_similar_func_res(f_addr, detect_res)
             if verbose > 0:
                 if match_idx < 0:
-                    print('%s(0x%x) finds no counterpart' % (new_detect_res[0], f_addr))
+                    print('%s(0x%x) finds no counterpart' % (new_detect_res[0], f_addr), file=output_stream)
                 else:
                     print('Match %s(0x%x) at %d (%s)' %
-                          (new_detect_res[0], f_addr, match_idx, str(new_detect_res[1][match_idx][1])))
-                print('%s : %s' % (new_detect_res[0], str(new_detect_res[1])))
+                          (new_detect_res[0], f_addr, match_idx, str(new_detect_res[1][match_idx][1])), file=output_stream)
+                print('%s : %s' % (new_detect_res[0], str(new_detect_res[1])), file=output_stream)
 
             if match_idx < 0:
                 continue
@@ -1497,5 +1594,9 @@ class Detector:
         #         top_n = top_ns[idx]
         #         top_n_match_count = top_n_match_counts[idx]
         #         print('Top %d match rate: %f (%d / %d)' %
-        #               (top_n, top_n_match_count / num_valid_f0, top_n_match_count, num_valid_f0))
+        #               (top_n, top_n_match_count / num_valid_f0, top_n_match_count, num_valid_f0), file=output_stream)
         return top_n_match_counts, num_valid_f0
+
+    def __str__(self):
+        return f"{self._p[0].filename} vs. {self._p[1].filename}"
+

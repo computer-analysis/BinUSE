@@ -1,5 +1,6 @@
+import traceback
+from angr import serializable
 from angr.sim_options import LAZY_SOLVES, UNDER_CONSTRAINED_SYMEXEC
-
 from src.cmp_tree import expr2tree
 from src.error import InvalidLipException, TimeoutForCollectingInfoException
 from src.utils import *
@@ -12,6 +13,7 @@ import pickle
 import signal
 from contextlib import contextmanager
 from collections import defaultdict
+import src.config_for_sym_exe as se_config
 
 
 def _set_x86_64_state_ip(state, v):
@@ -114,7 +116,7 @@ class FormulaExtractor:
             self._skip_regs = FormulaExtractor.AMD64_SKIP_REGS
             self._return_regs = FormulaExtractor.AMD64_RET_REGS
             # ignore the return value currently, since we cannot tell whether the function really returns
-            self._return_regs = set()
+            # self._return_regs = set()
             self._call_args_regs = FormulaExtractor.AMD64_CALL_ARGS_REGS
             self._get_se_info_func = self._get_amd64_se_info
             self._ptr_size = 64
@@ -174,15 +176,11 @@ class FormulaExtractor:
     def get_formulas_from(self, block_id, callees=None):
         log.debug('try to get formulas from RIB: %s' % str(block_id))
         try:
-            # with _time_limit_for_a_block(self._time_limit, block_id):
-            #     if isinstance(block_id, int):
-            #         return self._get_formulas_from(block_id)
-            #     else:
-            #         return self._get_formulas_from_rib(block_id, callees)
-            if isinstance(block_id, int):
-                return self._get_formulas_from(block_id)
-            else:
-                return self._get_formulas_from_rib(block_id, callees)
+            with _time_limit_for_a_block(self._time_limit, block_id):
+                if isinstance(block_id, int):
+                    return self._get_formulas_from(block_id)
+                else:
+                    return self._get_formulas_from_rib(block_id, callees)
         except InvalidLipException as e:
             log.error(str(e))
         except TimeoutForCollectingInfoException as e:
@@ -220,11 +218,11 @@ class FormulaExtractor:
         const_stack_ptr = claripy.BVV(0x400003, ptr_size)
 
         if ptr_size == 32:
-            stack_min_addr = 0x7ffef000
-            stack_max_addr = 0x7ffffff0
+            stack_min_addr = se_config.MIN_SP_VALUE_32
+            stack_max_addr = se_config.MAX_SP_VALUE_32
         elif ptr_size == 64:
-            stack_min_addr = 0x7fffffffff000000
-            stack_max_addr = 0x7fffffffffff0000
+            stack_min_addr = se_config.MIN_SP_VALUE_64
+            stack_max_addr = se_config.MAX_SP_VALUE_64
 
         def replace_ptr_value(f, recursion_depth):
             if not (hasattr(f, 'depth') and hasattr(f, 'args')):
@@ -470,6 +468,10 @@ class FormulaExtractor:
             return True, False, callees[end_instr_addr]
         elif 'call' in last_block.capstone.insns[-1].insn.mnemonic:
             return True, False, (int(last_block.capstone.insns[-1].insn.op_str, 16), None)
+            # try:
+            #     return True, False, (int(last_block.capstone.insns[-1].insn.op_str, 16), None)
+            # except ValueError:
+            #     return False, False, None
         elif 'ret' in last_block.capstone.insns[-1].insn.mnemonic:
             return False, True, None
         else:
@@ -690,6 +692,22 @@ class FormulaExtractor:
         sucs.flat_successors.append(state)
         self._cache_formuals_from_sucs(sucs, rib, init_state, callees, **kwargs)
 
+    def cache_constraint_from_state(self, state, rib: tuple, init_state, **kwargs):
+        # for return path, we only collect the constraints
+        # since we do not know whether the return register is meaningful
+        if rib[-1] is not None:
+            raise NotImplementedError("This is only used for unconstrained states")
+        sucs = SimSuccessors(init_state.addr, initial_state=init_state)
+        sucs.all_successors.append(state)
+        sucs.flat_successors.append(state)
+        tmp_rib = rib[:-1]
+        self._cache_formuals_from_sucs(sucs, tmp_rib, init_state, None,
+                                       reg_read=self._return_regs,
+                                       mem_read=set())
+        if tmp_rib in self._visited and isinstance(self._visited[tmp_rib], tuple):
+            self._visited[rib] = ([], self._visited[tmp_rib][1], self._visited[tmp_rib][2])
+            self._visited.pop(tmp_rib)
+
     def _get_formulas_from_rib(self, rib: tuple, callees=None):
         """
         Get the formulas from a list of blocks
@@ -700,6 +718,8 @@ class FormulaExtractor:
         :return:
         """
         if rib in self._visited:
+            if self._visited[rib] is None:
+                self._initialize_block_as_empty(rib)
             return self._visited[rib]
         if rib[0] in self._ignore_subgraph_roots.keys() and self._ignore_subgraph_roots[rib[0]] > 2:
             self._initialize_block_as_empty(rib)

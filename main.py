@@ -21,7 +21,7 @@ if __name__ == '__main__':
 
     start = time.time()
 
-    res = d.cmp_bins(mode='ri', progress_outfile=progress_outfile)
+    res = d.cmp_bins(mode='ri', progress_outfile=progress_outfile, not_sym_exe=False, no_skip=False)
     d.analyse_cmp_bins_res(res)
     d.save_to_disk(load_fail)
 

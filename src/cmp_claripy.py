@@ -44,16 +44,22 @@ def ne_formulas(f1, f2):
         raise NotImplementedError()
 
 
+loose_BV_sizes = [1, 8, 16, 32, 64]
+
+
 def eq_var(v1, v2):
     if isinstance(v1, claripy.ast.bv.BV) and isinstance(v2, claripy.ast.bv.BV):
-        if v1.size() == v2.size():
+        v1_size = v1.size()
+        v2_size = v2.size()
+        if v1_size == v2_size:
             return claripy.ast.Bool(op='__eq__', args=(v1, v2))
-        elif v1.size() == 32 and v2.size() == 64:
-            return claripy.And(claripy.ast.Bool(op='__eq__', args=(v1, claripy.Extract(31, 0, v2))),
-                               v2[63:32] == 0)
-        elif v1.size() == 64 and v2.size() == 32:
-            return claripy.And(claripy.ast.Bool(op='__eq__', args=(claripy.Extract(31, 0, v1), v2)),
-                               v1[63:32] == 0)
+        elif v1_size in loose_BV_sizes and v2_size in loose_BV_sizes:
+            if v1_size < v2_size:
+                return claripy.And(claripy.ast.Bool(op='__eq__', args=(v1, claripy.Extract(v1_size - 1, 0, v2))),
+                                   v2[v2_size - 1:v1_size] == 0)
+            else:
+                return claripy.And(claripy.ast.Bool(op='__eq__', args=(claripy.Extract(v2_size - 1, 0, v1), v2)),
+                                   v1[v1_size - 1:v2_size] == 0)
         else:
             return None
     elif isinstance(v1, claripy.ast.bool.Bool) and isinstance(v2, claripy.ast.bool.Bool):
@@ -79,38 +85,128 @@ def get_var_constraints(input1, input2):
         return None
 
 
-def prove_equal(f1, f2, _input1, _input2, c1=None, c2=None, cmp_limit=120, equal_var=True):
+def may_check_nullptr(c, ptr_size):
+    if isinstance(c, claripy.ast.bool.Bool):
+        if c.op == 'Not' and c.depth == 3:
+            c = c.args[0]
+            if c.op == '__eq__':
+                if isinstance(c.args[0], claripy.ast.bv.BV) and isinstance(c.args[1], claripy.ast.bv.BV) \
+                        and c.args[0].symbolic and not c.args[1].symbolic:
+                    # NULL is 0 for C code
+                    # the size must be pointer's size
+                    return c.args[1].args[0] == 0 and c.args[1].args[1] == ptr_size
+    return False
+
+
+def ignore_null_check(f, ptr_size):
     """
-    prove f1 == f2, using SMT solver Z3
-    :param f1:
-    :param f2:
-    :param _input1: use it to check the elements in input1
-    :param _input2: ...
-    :param c1: extra-constraints of f1
-    :param c2: extra-constraints of f2
-    :return:
+    f is a formula, with if condition
+    replace the constraints of f
     """
-    ne_f1_f2 = ne_formulas(f1, f2)
-    if ne_f1_f2 is None:
-        return False
+    if f.op == 'If':
+        condition = f.args[0]
+        new_condition = []
+        if condition.op == 'And':
+            for c in condition.args:
+                # log.debug((c, c.op, c.args))
+                if not may_check_nullptr(c, ptr_size):
+                    new_condition.append(c)
+            if len(new_condition) == len(condition.args):
+                return None
+            else:
+                if new_condition:
+                    return claripy.If(claripy.And(*new_condition),
+                                      f.args[1],
+                                      f.args[2])
+                else:
+                    return f.args[1]
+        else:
+            if not may_check_nullptr(condition, ptr_size):
+                return None
+            else:
+                return f.args[1]
+
+
+def check_if_inputs_match(f1, f2, equal_var):
     input1 = get_expression_input(f1)
     input2 = get_expression_input(f2)
-    if c1:
-        for tmp in c1:
-            input1.update(get_expression_input(tmp))
-    if c2:
-        for tmp in c2:
-            input2.update(get_expression_input(tmp))
     input1 = list(input1)
     input2 = list(input2)
-    # print('f1: ' + str(f1))
-    # print('f2: ' + str(f2))
     if equal_var and len(input1) != len(input2):
         # tentatively we treat expressions with different number of inputs as different, we do not prove
         input1 = list(remove_extract(input1))
         input2 = list(remove_extract(input2))
         if len(input1) != len(input2):
-            return False
+            log.debug(f'diff # inputs {len(input1)} and {len(input2)}')
+            log.debug(input1)
+            log.debug(input2)
+    return input1, input2
+
+
+def check_and_return_formula_pair_with_inputs(f1, f2, ptr_size1, ptr_size2):
+    input1, input2 = check_if_inputs_match(f1, f2, True)
+    # if len(input1) != len(input2):
+    #     return False
+    if len(input1) != len(input2):
+        f1 = ignore_null_check(f1, ptr_size1)
+        f2 = ignore_null_check(f2, ptr_size2)
+        if f1 is None or f2 is None:
+            return None, None
+        log.debug(f'Ignore null check {str(f1)} {str(f2)}')
+        input1, input2 = check_if_inputs_match(f1, f2, True)
+        if len(input1) != len(input2):
+            return None, None
+    return (f1, input1), (f2, input2)
+
+
+def prove_equal(merged_f1, merged_f2, ptr_size1, ptr_size2, c1=None, c2=None, cmp_limit=120, equal_var=True):
+    """
+    prove f1 == f2, using SMT solver Z3
+    :param f1:
+    :param f2:
+    :param c1: extra-constraints of f1
+    :param c2: extra-constraints of f2
+    :return:
+    """
+    log.debug('prove_equal')
+    f1, orig_f1 = merged_f1
+    f2, orig_f2 = merged_f2
+    if c1 is not None and c2 is not None:
+        if len(c1) > 0 and len(c2) > 0:
+            solver = claripy.Solver(backend=_MyBackendZ3())
+            # our normalization may make the constraints become UNSAT, ignore it when it happens
+            try:
+                if not solver.satisfiable(c1) or not solver.satisfiable(c2):
+                    f1 = orig_f1
+                    f2 = orig_f2
+                    c1 = None
+                    c2 = None
+            except Exception:
+                f1 = orig_f1
+                f2 = orig_f2
+                c1 = None
+                c2 = None
+
+    # ne_f1_f2 = ne_formulas(f1, f2)
+    # if ne_f1_f2 is None:
+    #     log.debug("fail1 to create not_equal formula")
+    #     log.debug(f1)
+    #     log.debug(f2)
+    #     return False
+    f1_in1, f2_in2 = check_and_return_formula_pair_with_inputs(f1, f2, ptr_size1, ptr_size2)
+    if f1_in1 is None or f2_in2 is None:
+        log.debug('inputs variables do not match')
+        return False
+    f1, input1 = f1_in1
+    f2, input2 = f2_in2
+    ne_f1_f2 = ne_formulas(f1, f2)
+    if ne_f1_f2 is None:
+        log.debug("fail to create not_equal formula")
+        log.debug(f1)
+        log.debug(f2)
+        return False
+    log.debug(f"To prove {str(ne_f1_f2)} UNSAT")
+
     count = 0
     min_num_var = min(len(input1), len(input2))
     if min_num_var == 0:
@@ -153,7 +249,15 @@ def prove_equal(f1, f2, _input1, _input2, c1=None, c2=None, cmp_limit=120, equal
             if not solver.satisfiable(extra_constraints=constraints):
                 return True
         except Exception as e:
-            log.error('Meet Z3 solver error %s' % str(e))
+            # print('f1', f1)
+            # print('f2', f2)
+            # print('input1', input1)
+            # print('input2', input2)
+            # constraints = get_var_constraints(in1, input2[:min_num_var])
+            # print('constraints')
+            # for c in constraints:
+            #     print(c)
+            log.warning('Meet Z3 solver error %s' % str(e))
     return False
 
 
@@ -225,24 +329,25 @@ def ast_prove_f1_in_f2(f1, f2, c1=None, c2=None):
                         if not solver.satisfiable([unsat_expr, ec3]):
                             return True
         except Exception as e:
-            log.error('Meet Z3 solver error %s' % str(e))
+            log.warning('Meet Z3 solver error %s' % str(e))
     return False
 
 
-def ast_prove_f1_equi_f2(f1, f2, cmp_limit=720, equal_var=True):
+def ast_prove_f1_equi_f2(f1, f2, ptr_size1, ptr_size2, cmp_limit=720, equal_var=True):
+    log.debug('ast_prove_f1_equi_f2')
+    f1_in1, f2_in2 = check_and_return_formula_pair_with_inputs(f1, f2, ptr_size1, ptr_size2)
+    if f1_in1 is None or f2_in2 is None:
+        log.debug('inputs variables do not match')
+        return False
+    f1, input1 = f1_in1
+    f2, input2 = f2_in2
     ne_f1_f2 = ne_formulas(f1, f2)
     if ne_f1_f2 is None:
+        log.debug("fail2 to create not_equal formula")
+        log.debug(f1)
+        log.debug(f2)
         return False
-    input1 = list(get_expression_input(f1))
-    input2 = list(get_expression_input(f2))
-
-    # no constraints, merely prove once
-    if equal_var and len(input1) != len(input2):
-        # tentatively we treat expressions with different number of inputs as different, we do not prove
-        input1 = list(remove_extract(input1))
-        input2 = list(remove_extract(input2))
-        if len(input1) != len(input2):
-            return False
+    log.debug(f"To prove {str(ne_f1_f2)} UNSAT")
 
     solver = claripy.Solver(backend=_MyBackendZ3())
     solver.add(ne_f1_f2)
@@ -259,5 +364,5 @@ def ast_prove_f1_equi_f2(f1, f2, cmp_limit=720, equal_var=True):
             if not solver.satisfiable(extra_constraints=(ec1,)):
                 return True
         except Exception as e:
-            log.error('Meet Z3 solver error %s' % str(e))
+            log.warning('Meet Z3 solver error %s' % str(e))
     return False
