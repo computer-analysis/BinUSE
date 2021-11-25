@@ -159,6 +159,14 @@ def check_and_return_formula_pair_with_inputs(f1, f2, ptr_size1, ptr_size2):
     return (f1, input1), (f2, input2)
 
 
+def factorial(n):
+    res = 1
+    while n > 1:
+        res *= n
+        n -= 1
+    return res
+
+
 def prove_equal(merged_f1, merged_f2, ptr_size1, ptr_size2, c1=None, c2=None, cmp_limit=120, equal_var=True):
     """
     prove f1 == f2, using SMT solver Z3
@@ -214,6 +222,9 @@ def prove_equal(merged_f1, merged_f2, ptr_size1, ptr_size2, c1=None, c2=None, cm
         solver = claripy.Solver(backend=_MyBackendZ3())
         solver.add(ne_f1_f2)
         return not solver.satisfiable()
+
+    if factorial(min_num_var) > cmp_limit:
+        raise TooManyVariables4Comparison(f1, f2, cmp_limit)
 
     for in1 in permutations(input1, min_num_var):
         constraints = []

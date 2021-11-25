@@ -3,7 +3,7 @@ import logging
 import angr
 import claripy
 
-log = logging.getLogger('py-cop')
+log = logging.getLogger('BinUSE')
 log.setLevel('WARNING')
 # log.setLevel('DEBUG')
 

@@ -584,33 +584,6 @@ class Detector:
             raise InvalidFunctionException(start1)
         log.info('There are %d LIPs from %s and %d LIPs from %s' % (len(ks0), self._p[0].filename,
                                                                     len(ks1), self._p[1].filename))
-        # compare merged formulas first
-        # if libcalls0 is not None:
-        #     # please have a look of helper function get_formula_keys
-        #     already_matched_keys = set()
-        #     all_merged_formulas_num = 0
-        #     for libcall_addr0 in merged_args0.keys():
-        #         for v0_name, merged_f0, valid_cons0 in merged_args0[libcall_addr0]:
-        #             all_merged_formulas_num += 1
-        #             for libcall_addr1 in merged_args1.keys():
-        #                 tmp_matched = False
-        #                 for v1_name, merged_f1, valid_cons1 in merged_args1[libcall_addr1]:
-        #                     if (libcall_addr1, v1_name) in already_matched_keys:
-        #                         continue
-        #                     try:
-        #                         if prove_equal(merged_f0, merged_f1, None, None, [valid_cons0], [valid_cons1],
-        #                                        equal_var=False):
-        #                             already_matched_keys.add((libcall_addr1, v1_name))
-        #                             tmp_matched = True
-        #                             break
-        #                     except TooManyVariables4Comparison as e:
-        #                         log.error(e.__class__)
-        #                 if tmp_matched:
-        #                     break
-        #     if all_merged_formulas_num > 0 and len(already_matched_keys) / all_merged_formulas_num > 0:
-        #         self._compared_res[(start0, start1)] = (len(already_matched_keys) / all_merged_formulas_num, 1.0 - sim)
-        #         return self._compared_res[(start0, start1)]
-
         # compare formulas and constraints 1 by 1
         already_matched_keys = set()
         # compute the comparing times. if it is large than a threshold, we do not compare every 2 path, but use
@@ -625,35 +598,35 @@ class Detector:
                     continue
                 if not similar_libcalls(k0, k1):
                     continue
-                if k0[-1] in merged_args0.keys() and k1[-1] in merged_args1.keys():
-                    if merged_args0[k0[-1]][0][0] is None and merged_args1[k1[-1]][0][0] is None:
-                        # here is a libcall with no argument
-                        tried_merged_libcall.add((k0[-1], k1[-1]))
-                        c0 = merged_args0[k0[-1]][0][2]
-                        c1 = merged_args1[k1[-1]][0][2]
-                        try:
-                            if ast_prove_f1_equi_f2(c0, c1, self._fe[0].ptr_size, self._fe[1].ptr_size, 720):
-                                for tmp_path in merged_args0[k0[-1]][0][1]:
-                                    already_matched_keys.add(tmp_path)
-                                continue
-                        except TooManyVariables4Comparison as e:
-                            log.warning("meet %s while comparing 0x%x (%s) with 0x%x (%s)" %
-                                        (str(e.__class__), start0, self._p[0].filename, start1, self._p[1].filename))
-                            # in this case, since we do not know whether they are equivalent.
-                            # to achieve a low FN, we treat it as similar
-                            for tmp_path in merged_args0[k0[-1]][0][1]:
-                                already_matched_keys.add(tmp_path)
-                            continue
-                        except Exception as e:
-                            log.error("meet %s while comparing 0x%x (%s) with 0x%x (%s)" %
-                                      (str(e), start0, self._p[0].filename, start1, self._p[1].filename))
-                            exc_type, exc_obj, exc_tb = sys.exc_info()
-                            err_fname = os.path.split(exc_tb.tb_frame.f_code.co_filename)[1]
-                            log.error('Unexpected error from %s' % str((exc_type, err_fname, exc_tb.tb_lineno)))
-                            # log.error(traceback.format_exc())
-                            for tmp_path in merged_args0[k0[-1]][0][1]:
-                                already_matched_keys.add(tmp_path)
-                            continue
+                # if k0[-1] in merged_args0.keys() and k1[-1] in merged_args1.keys():
+                #     if merged_args0[k0[-1]][0][0] is None and merged_args1[k1[-1]][0][0] is None:
+                #         # here is a libcall with no argument
+                #         tried_merged_libcall.add((k0[-1], k1[-1]))
+                #         c0 = merged_args0[k0[-1]][0][2]
+                #         c1 = merged_args1[k1[-1]][0][2]
+                #         try:
+                #             if ast_prove_f1_equi_f2(c0, c1, self._fe[0].ptr_size, self._fe[1].ptr_size, 720):
+                #                 for tmp_path in merged_args0[k0[-1]][0][1]:
+                #                     already_matched_keys.add(tmp_path)
+                #                 continue
+                #         except TooManyVariables4Comparison as e:
+                #             log.warning("meet %s while comparing 0x%x (%s) with 0x%x (%s)" %
+                #                         (str(e.__class__), start0, self._p[0].filename, start1, self._p[1].filename))
+                #             # in this case, since we do not know whether they are equivalent.
+                #             # to achieve a low FN, we treat it as similar
+                #             for tmp_path in merged_args0[k0[-1]][0][1]:
+                #                 already_matched_keys.add(tmp_path)
+                #             continue
+                #         except Exception as e:
+                #             log.error("meet %s while comparing 0x%x (%s) with 0x%x (%s)" %
+                #                       (str(e), start0, self._p[0].filename, start1, self._p[1].filename))
+                #             exc_type, exc_obj, exc_tb = sys.exc_info()
+                #             err_fname = os.path.split(exc_tb.tb_frame.f_code.co_filename)[1]
+                #             log.error('Unexpected error from %s' % str((exc_type, err_fname, exc_tb.tb_lineno)))
+                #             # log.error(traceback.format_exc())
+                #             for tmp_path in merged_args0[k0[-1]][0][1]:
+                #                 already_matched_keys.add(tmp_path)
+                #             continue
 
                 tmp = cmp(k0, k1)
                 if tmp >= self._symbolic_eq_block_threshold:

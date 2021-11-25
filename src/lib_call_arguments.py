@@ -26,7 +26,8 @@ X86_CALL_ARGUMENTS_MAP = {
     '.fwrite': [4, 8, 12, 16],
     '.__errno_location': None,
     '.abort': None,
-    '.localeconv': None
+    '.localeconv': None,
+    '.__assert_fail': [4, 8]
 }
 
 AARCH64_CALL_ARGUMENTS_MAP = {

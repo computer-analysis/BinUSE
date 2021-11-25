@@ -7,14 +7,20 @@ _SIM_LIB_CALLS = [
     ['.printf', '.__printf_chk'],
     ['.fprintf', '.__fprintf_chk'],
     ['.snprintf', '.__snprintf_chk'],
+    ['.sprintf', '.__sprintf_chk'],
+    ['.strcpy', '.__strcpy_chk'],
+    ['.asprintf', '.__asprintf_chk'],
+    # ['.strcmp', '.bsearch'],
     ['.toupper', '.__ctype_toupper_loc'],
     ['.tolower', '.__ctype_tolower_loc'],
+    ['.siglongjmp', '.__longjmp_chk'],
     ['.fseeko', '.fseeko64'],
     ['.lseek', '.lseek64'],
     ['.open', '.open64'],
     ['.__libc_start_main', '__libc_start_main'],
     ['.__cxa_finalize', '__cxa_finalize'],
-    ['.malloc', 'malloc']
+    ['.__xstat64', '.__xstat'],
+    ['.realpath', '.__realpath_chk'],
 ]
 
 _SIM_LIB_CALL_GROUPS = [
@@ -23,7 +29,7 @@ _SIM_LIB_CALL_GROUPS = [
 
 # these lib calls are likely inlined by compiler
 _LIB_CALL_LOW_WEIGHT = [
-    '.strcmp', 'strcmp', '.strncmp',
+    '.strcmp', 'strcmp', '.strncmp', '.bsearch'
     '.strcpy', 'strcpy',
     '.getc_unlocked',
     '.__uflow',  # this is a C-built-in function which is called merely with optimization
@@ -46,6 +52,8 @@ SIM_LIB_CALL_DICT = get_sim_lib_call_dict()
 def get_func_names_with_similar_libcall_replacement(funcs):
     res = []
     for f in funcs:
+        if not f.startswith('.'):
+            f = f".{f}"
         if f not in SIM_LIB_CALL_DICT.keys():
             res.append(f)
         else:
