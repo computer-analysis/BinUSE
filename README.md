@@ -1,13 +1,6 @@
 # BinUSE
 This is the prototype implementation of BinUSE.
 
-Note that this implementation is an early version, which is different
-from the current submission of TSE. Here I merely update this repo
-with return constraints collection and bug fixes.
-
-I plan to rewrite this work in three month, and provide a more usable tool with
-readable code. There are some deadcode and the code structure is not well designed.
-
 # Requirement
 `python3 (>= 3.6.5)` and `ida pro (7.3)`
 
